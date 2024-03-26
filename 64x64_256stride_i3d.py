@@ -44,7 +44,7 @@ from torch.utils.data import DataLoader, Dataset
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from torch.utils.data import DataLoader, Dataset
-from i3dallnl import InceptionI3d
+from i3dall import InceptionI3d
 import torch.nn as nn
 import torch
 from warmup_scheduler import GradualWarmupScheduler
@@ -55,10 +55,10 @@ class CFG:
     comp_name = 'vesuvius'
 
     # comp_dir_path = './'
-    comp_dir_path = './'
-    comp_folder_name = './'
+    comp_dir_path = '/content/gdrive/MyDrive/vesuvius_model/training'
+    comp_folder_name = '/content/gdrive/MyDrive/vesuvius_model/training'
     # comp_dataset_path = f'{comp_dir_path}datasets/{comp_folder_name}/'
-    comp_dataset_path = f'./'
+    comp_dataset_path = f'/content/gdrive/MyDrive/vesuvius_model/training'
     
     exp_name = 'pretraining_all'
 
@@ -113,7 +113,7 @@ class CFG:
     # ============== set dataset path =============
     print('set dataset path')
 
-    outputs_path = f'./outputs/{comp_name}/{exp_name}/'
+    outputs_path = f'/content/gdrive/MyDrive/vesuvius_model/training/outputs'
 
     submission_dir = outputs_path + 'submissions/'
     submission_path = submission_dir + f'submission_{exp_name}.csv'
@@ -260,7 +260,7 @@ def get_train_valid_dataset():
     valid_images = []
     valid_masks = []
     valid_xyxys = []
-    for fragment_id in ['20231022170900','20231005123333','20230820203112','20230620230619','20230530164535','20230826170124','20230702185753','20230620230617','20230522215721','20230701020044','20230901184804','20230531193658','20230520175435','20230903193206','20230902141231','20231007101615','20230929220924','recto','verso','20231012173610','20231016151000','20231012184421','20231031143850','20231106155350']:
+    for fragment_id in ['20230702185753','20230929220926','20231005123336','20231007101619','20231012184423','20231016151002','20231022170901','20231031143852','20231106155351','20231210121321','20231221180251','20230820203112']:
     # for fragment_id in ['20230820203112','20231005123333']:
 #,
         
@@ -584,11 +584,11 @@ for fid in fragments:
     multiplicative = lambda epoch: 0.9
 
     trainer = pl.Trainer(
-        max_epochs=7,
+        max_epochs=12,
         accelerator="gpu",
         devices=4,
         logger=wandb_logger,
-        default_root_dir="./models",
+        default_root_dir="/content/gdrive/MyDrive/vesuvius_model/training/outputs",
         accumulate_grad_batches=1,
         precision='16-mixed',
         gradient_clip_val=1.0,

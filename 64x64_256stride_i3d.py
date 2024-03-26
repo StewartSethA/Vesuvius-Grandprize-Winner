@@ -44,7 +44,7 @@ from torch.utils.data import DataLoader, Dataset
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from torch.utils.data import DataLoader, Dataset
-from i3dall import InceptionI3d
+from i3dallnl import InceptionI3d
 import torch.nn as nn
 import torch
 from warmup_scheduler import GradualWarmupScheduler

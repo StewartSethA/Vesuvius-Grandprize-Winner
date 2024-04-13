@@ -1,6 +1,7 @@
+from PIL import Image
+Image.MAX_IMAGE_PIXELS = 933120000
 import os.path as osp
 import os
-os.environ["WANDB_MODE"] = "offline"
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -56,6 +57,8 @@ import json
 import numba
 from numba import jit
 
+from dataloaders import *
+
 class CFG:
     # ============== comp exp name =============
     comp_name = 'vesuvius'
@@ -65,7 +68,7 @@ class CFG:
     comp_folder_name = './' #'/content/gdrive/MyDrive/vesuvius_model/training'
     # comp_dataset_path = f'{comp_dir_path}datasets/{comp_folder_name}/'
     comp_dataset_path = './' #f'/content/gdrive/MyDrive/vesuvius_model/training'
-    basepath = '../Vesuvius/'
+    
     exp_name = 'pretraining_all'
 
     # ============== pred target =============
@@ -79,12 +82,24 @@ class CFG:
     in_chans = 30 # 65
     encoder_depth=5
     # ============== training cfg =============
+    # For Final model
+    
     size = 64
     tile_size = 256
     stride = tile_size // 8
 
-    train_batch_size = 256 # 32
-    valid_batch_size = train_batch_size
+    train_batch_size = 256 #256 #64 #256 # 32 # 64 is STABLE w/o NaNs!
+    valid_batch_size = 256 #train_batch_size
+    '''
+    size = 256
+    tile_size = 1024
+    stride = tile_size // 8
+
+    train_batch_size = 16 # 32
+    valid_batch_size = 64 #train_batch_size
+    #'''
+    # ^ QUICK AND DIRTY LABEL BOOTSTRAPPING WITH COARSER NETWORK
+
     use_amp = True
 
     scheduler = 'GradualWarmupSchedulerV2'
@@ -97,8 +112,7 @@ class CFG:
     # lr = 1e-4 / warmup_factor
     lr = 2e-5
     # ============== fold =============
-    #valid_id = '20230820203112'
-    valid_id = '20231012184423'
+    valid_id = '20231210132040' #'20240304141530' #'20230820203112'
 
     # objective_cv = 'binary'  # 'binary', 'multiclass', 'regression'
     metric_direction = 'maximize'  # maximize, 'minimize'
@@ -135,12 +149,12 @@ class CFG:
 
     # ============== augmentation =============
     train_aug_list = [
-        # A.RandomResizedCrop(
+        #A.RandomResizedCrop(
         #     size, size, scale=(0.85, 1.0)),
         A.Resize(size, size),
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
-        # A.RandomRotate90(p=0.6),
+        A.RandomRotate90(p=0.6), # SethS
 
         A.RandomBrightnessContrast(p=0.75),
         A.ShiftScaleRotate(rotate_limit=360,shift_limit=0.15,scale_limit=0.1,p=0.75),
@@ -149,7 +163,7 @@ class CFG:
                 A.GaussianBlur(),
                 A.MotionBlur(),
                 ], p=0.4),
-        # A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.5),
+        A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.9), #SethS
         A.CoarseDropout(max_holes=2, max_width=int(size * 0.2), max_height=int(size * 0.2), 
                         mask_fill_value=0, p=0.5),
         # A.Cutout(max_h_size=int(size * 0.6),
@@ -219,16 +233,36 @@ def read_image_mask(fragment_id,start_idx=15,end_idx=45):
 
 
     t = time.time()
-    if os.path.isfile(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{fragment_id}.npy"):
+    loaded = False
+    print("Checking for", CFG.comp_dataset_path + f"train_scrolls/{fragment_id}_{start_idx}-{end_idx}.npy")
+    if os.path.isfile(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}_{start_idx}-{end_idx}.npy"):
+      print("Reading", CFG.comp_dataset_path + f"train_scrolls/{fragment_id}_{start_idx}-{end_idx}.npy")
+      images = np.load(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}_{start_idx}-{end_idx}.npy", images) # Seths
+      pad0 = (CFG.tile_size - images.shape[0] % CFG.tile_size)
+      pad1 = (CFG.tile_size - images.shape[1] % CFG.tile_size)
+      loaded = True
+    elif start_idx == 15 and os.path.isfile(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{fragment_id}.npy"):
+      print("Reading", CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{fragment_id}.npy")
+      #if os.path.isfile(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{fragment_id}_{start_idx}-{end_idx}.npy"): # TODO: Infer smallest possible numpy file to make it work from os.listdir
       images = np.load(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{fragment_id}.npy")
       pad0 = (CFG.tile_size - images.shape[0] % CFG.tile_size)
       pad1 = (CFG.tile_size - images.shape[1] % CFG.tile_size)
       print(time.time()-t, "seconds taken to load images from", CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{fragment_id}.npy")
-    else:
+      if images.shape[-1] >= end_idx:
+        loaded = True
+    if not loaded:
+      #idxs = range(64)
       for i in idxs:
-        
-        image = cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{i:02}.tif", 0)
-
+        for ext in ['jpg', 'tif']:
+          print("Loading", f"train_scrolls/{fragment_id}/layers/{i:02}.{ext}")
+          image = cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{i:02}.{ext}", 0)
+          if image is None: # TODO SethS: We need to accommodate a deeper stack of images here...
+            image = cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{i:03}.{ext}", 0)
+          if image is None:
+            print("WARNING: FAILED TO LOAD!", f"train_scrolls/{fragment_id}/layers/{i:02}.{ext}")
+            return None, None, None
+          if image is not None:
+            break
         pad0 = (CFG.tile_size - image.shape[0] % CFG.tile_size)
         pad1 = (CFG.tile_size - image.shape[1] % CFG.tile_size)
 
@@ -247,7 +281,9 @@ def read_image_mask(fragment_id,start_idx=15,end_idx=45):
       t = time.time()
       print(time.time()-t, "seconds taken to stack images.")
       t = time.time()
-      np.save(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{fragment_id}.npy", images)
+      #np.save(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/layers/{fragment_id}_0-{images.shape[-1]}.npy", images) # Seths
+      print("saving", CFG.comp_dataset_path + f"train_scrolls/{fragment_id}_{start_idx}-{end_idx}.npy", images.shape) # Seths
+      np.save(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}_{start_idx}-{end_idx}.npy", images) # Seths
       print(time.time()-t, "seconds taken to save images as npy.")
     if fragment_id in ['20230701020044','verso','20230901184804','20230901234823','20230531193658','20231007101615','20231005123333','20231011144857','20230522215721', '20230919113918', '20230625171244','20231022170900','20231012173610','20231016151000']:
 
@@ -270,10 +306,29 @@ def read_image_mask(fragment_id,start_idx=15,end_idx=45):
         fragment_mask = cv2.resize(fragment_mask, (fragment_mask.shape[1]//2,fragment_mask.shape[0]//2), interpolation = cv2.INTER_AREA)
         mask = cv2.resize(mask , (mask.shape[1]//2,mask.shape[0]//2), interpolation = cv2.INTER_AREA)
 
-    print("images.shape,dtype", images.shape, images.dtype, "mask", mask.shape, mask.dtype, "fragment_mask", fragment_mask.shape, fragment_mask.dtype)
+
+    if mask is not None and images is not None and fragment_mask is not None:
+      print("images.shape,dtype", images.shape, images.dtype, "mask", mask.shape, mask.dtype, "fragment_mask", fragment_mask.shape, fragment_mask.dtype)
     return images, mask,fragment_mask
 
 # TODO: How to grow training set over time??? Automatically look in directory, but need .zarrs to be able to load dynamically.
+def reload_masks(masks):
+  print("reloadiing ink labels")
+  newmasks = {}
+  for fragment_id in masks.keys():
+    print("reloading", fragment_id)
+    if fragment_id=='20231022170900':
+        mask = cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/{fragment_id}_inklabels.tiff", 0)
+    else:
+        mask = cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/{fragment_id}_inklabels.png", 0)
+    if 'frag' in fragment_id:
+        fragment_mask = cv2.resize(fragment_mask, (fragment_mask.shape[1]//2,fragment_mask.shape[0]//2), interpolation = cv2.INTER_AREA)
+        mask = cv2.resize(mask , (mask.shape[1]//2,mask.shape[0]//2), interpolation = cv2.INTER_AREA)
+    newmasks[fragment_id] = mask[:,:,None] if mask is not None else None
+  return newmasks
+
+def reload_validationset():
+  pass
 
 #from numba import vectorize
 #@vectorize
@@ -281,6 +336,8 @@ def read_image_mask(fragment_id,start_idx=15,end_idx=45):
 def generate_xyxys_ids(fragment_id, image, mask, fragment_mask, tile_size, size, stride, is_valid=False):
         xyxys = []
         ids = []
+        #if is_valid:
+        #  stride = stride * 2
         x1_list = list(range(0, image.shape[1]-tile_size+1, stride))
         y1_list = list(range(0, image.shape[0]-tile_size+1, stride))
         #x1_list = list(range(0, image.size()[1]-tile_size+1, stride))
@@ -324,25 +381,35 @@ def get_xyxys(fragment_ids, is_valid=False):
     for fragment_id in fragment_ids:
         #start_idx = len(fragment_ids)
         print('reading ',fragment_id)
-        image, mask,fragment_mask = read_image_mask(fragment_id)
+        image, mask,fragment_mask = read_image_mask(fragment_id, 0, 65)
 
         images[fragment_id] = image
+        if image is None:
+          masks[fragment_id] = None
+          continue
+          #return None, None, None, None
+        if mask is None:
+          print("Defaulting to empty mask! I hope this is just for inference!", fragment_id)
+          mask = np.zeros_like(image[:,:,0])
+
         masks[fragment_id] = mask[:,:,None]
         t = time.time()
-        if os.path.isfile(fragment_id + ".ids.json"):
-          with open(fragment_id + ".ids.json", 'r') as f:
+        validlabel="valid" if is_valid else "train"
+        savename = fragment_id + validlabel+str(CFG.tile_size)+"_"+str(CFG.size)+"_"+str(CFG.stride)
+        if os.path.isfile(savename+".ids.json"):
+          with open(savename + ".ids.json", 'r') as f:
             id = json.load(f)
-        if os.path.isfile(fragment_id + ".xyxys.json"):
-          with open(fragment_id + ".xyxys.json", 'r') as f:
+        if os.path.isfile(savename + ".xyxys.json"):
+          with open(savename + ".xyxys.json", 'r') as f:
             xyxy = json.load(f)
         else:
           xyxy, id = generate_xyxys_ids(fragment_id, image, mask, fragment_mask, CFG.tile_size, CFG.size, CFG.stride, is_valid)
-          with open(fragment_id + ".ids.json", 'w') as f:
+          with open(savename + ".ids.json", 'w') as f:
             #if fragment_id != CFG.valid_id:
               json.dump(id, f) #[start_idx:], f)
             #else:
             #  json.dump(valid_ids, f)
-          with open(fragment_id + ".xyxys.json", 'w') as f:
+          with open(savename +".xyxys.json", 'w') as f:
             #if fragment_id != CFG.valid_id:
             json.dump(xyxy, f) #[start_idx:],f)
             #else:
@@ -363,8 +430,18 @@ def get_train_valid_dataset():
     valid_masks = {}
     valid_xyxys = []
     valid_ids = []
-    train_ids = set(['20230702185753','20230929220926','20231005123336','20231012184423','20231007101619','20231016151002','20231022170901','20231031143852','20231106155351','20231210121321','20231221180251','20230820203112']) - set([CFG.valid_id])
-    valid_ids = set([CFG.valid_id])
+    train_ids = set(['20231210132040', '20230702185753','20230929220926','20231005123336','20231007101619','20231012184423','20231016151002','20231022170901','20231031143852','20231106155351','20231210121321','20231221180251','20230820203112']) - set([CFG.valid_id])
+    #train_ids = set(['20230702185753','20230929220926','20231005123336','20231007101619','20231012184423','20231016151002','20231022170901','20231031143852','20231106155351','20231210121321','20231221180251','20230820203112']) - set([CFG.valid_id])
+    #train_ids  = set(["20240304141530", "20231210132030", "20231122192640", "20231215151901"]) #"20230702185753"])
+    #train_ids  = set(["20240304141530", "20231210132030", "20231215151901"]) #, "20231122192640") #, "20231215151901"]) #"20230702185753"]) # TODO add 640 back in once it's there!!! HOW TO TRAIN ON IT???
+    #train_ids  = set(["20240304141530"]) #, "20231215151901"]) #, "20231122192640") #, "20231215151901"]) #"20230702185753"]) # TODO add 640 back in once it's there!!! HOW TO TRAIN ON IT???
+    #train_ids  = set(["20240304141530", "20231210132030", "20231210132040", "20231122192640", "20231215151901"]) #"20230702185753"])
+    #train_ids  = set(["20231210132040", "20230702185753"])
+    #train_ids  = set(["20231210132030", "20231210132040", "20231215151901"]) #"20230702185753"])
+    #train_ids  = set(["20240304141530", "20231210132030", "20231210132040", "20231215151901"]) #"20230702185753"])
+    CFG.valid_id = "20231210132040" #"20231215151901" #20240304141530"
+    #valid_ids = set([CFG.valid_id, "20231111135340", "20231122192640"]+list(train_ids))
+    valid_ids = set([CFG.valid_id]+list(train_ids))
     train_images, train_masks, train_xyxys, train_ids = get_xyxys(train_ids, False)
     valid_images, valid_masks, valid_xyxys, valid_ids = get_xyxys(valid_ids, True)
     return train_images, train_masks, train_xyxys, train_ids, valid_images, valid_masks, valid_xyxys, valid_ids
@@ -393,7 +470,7 @@ class CustomDataset(Dataset):
         x[x<.4]=0
         x[x>.633]=2
         x[(x>.4)&(x<.633)]=1
-        mask=cv2.resize(x, (x.shape[1]*64,x.shape[0]*64), interpolation = cv2.INTER_AREA)
+        mask=cv2.resize(x, (x.shape[1]*64,x.shape[0]*64), interpolation = cv2.INTER_AREA) # This thing!
         x=np.zeros((self.cfg.size,self.cfg.size,self.cfg.in_chans)).astype(np.uint8)
         for i in range(3):
             x=np.where(np.repeat((mask==0).reshape(self.cfg.size,self.cfg.size,1), self.cfg.in_chans, axis=2),y[:,:,i:self.cfg.in_chans+i],x)
@@ -424,8 +501,15 @@ class CustomDataset(Dataset):
         if self.xyxys is not None:
             id = self.ids[idx]
             x1,y1,x2,y2=xy=self.xyxys[idx]
-            image = self.images[id][y1:y2,x1:x2] #,self.start:self.end] #[idx]
+            start = random.randint(0, self.images[id].shape[-1]-30)
+            end = start + 30
+            image = self.images[id][y1:y2,x1:x2,start:end] # SethS random depth select aug! #,self.start:self.end] #[idx]
             label = self.labels[id][y1:y2,x1:x2]
+            # TODO: NEED different random crops!!! Including rotations!
+            if image.shape[:2] != label.shape[:2]:
+              print("MISMATCHED image, label", id, image.shape, label.shape)
+              return self[idx+1]
+            #print(label.shape)
             if self.transform:
                 data = self.transform(image=image, mask=label)
                 image = data['image'].unsqueeze(0)
@@ -473,7 +557,7 @@ class CustomDatasetTest(Dataset):
 
         return image,xy
 
-from dataloaders import *
+
 
 # from resnetall import generate_model
 def init_weights(m):
@@ -506,7 +590,7 @@ class Decoder(nn.Module):
 
 
 class RegressionPLModel(pl.LightningModule):
-    def __init__(self,pred_shape,size=256,enc='',with_norm=False,train_dataset=None,check_val_every_n_epoch=1):
+    def __init__(self,pred_shape,size=256,enc='',with_norm=False,train_dataset=None,check_val_every_n_epoch=2):
         super(RegressionPLModel, self).__init__()
 
         self.save_hyperparameters()
@@ -515,7 +599,24 @@ class RegressionPLModel(pl.LightningModule):
 
         self.loss_func1 = smp.losses.DiceLoss(mode='binary')
         self.loss_func2= smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.25)
-        self.loss_func= lambda x,y:0.5 * self.loss_func1(x,y)+0.5*self.loss_func2(x,y)
+        #self.loss_func= lambda x,y:0.5 * self.loss_func1(x,y)+0.5*self.loss_func2(x,y)
+        def loss_func(x,y):
+          loss1 = self.loss_func1(x,y)
+          loss2 = self.loss_func2(x,y)
+          if torch.isnan(loss1) or torch.isinf(loss1):
+            print("DiceLoss is nan", loss1)
+            loss1 = 0
+          if torch.isnan(loss2) or torch.isinf(loss2):
+            print("BCELoss is nan", loss2)
+            loss2 = 0
+          loss = 0.5 * loss1 + 0.5 * loss2
+          if loss == 0:
+            print("Checking for nans in forward", x, y)
+          if loss == 0:
+            loss = ((x-y)**2).mean()
+          #print(loss) @ SethS
+          return loss
+        self.loss_func= loss_func #lambda x,y:0.5 * self.loss_func1(x,y)+0.5*self.loss_func2(x,y)
 
         self.backbone=InceptionI3d(in_channels=1,num_classes=512,non_local=True)        
         self.decoder = Decoder(encoder_dims=[x.size(1) for x in self.backbone(torch.rand(1,1,20,256,256))], upscale=1)
@@ -540,6 +641,14 @@ class RegressionPLModel(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         x, y, xys = batch
         outputs = self(x)
+        #print("x,y,o", x.shape, y.shape, outputs.shape)
+        if batch_idx % 10 == 0:
+          #print(x.min(), x.max(), x.mean(), x.std())
+          #print(y.min(), y.max(), y.mean(), y.std())
+          #print(outputs.min(), outputs.max(), outputs.mean(), outputs.std())
+          cv2.imwrite("x_"+str(batch_idx)+".png", 255*x[0,0,15:18,:,:].detach().cpu().numpy().transpose(1,2,0).astype(np.uint8))
+          cv2.imwrite("y_"+str(batch_idx)+".png", 255*y[0,0,:,:].detach().cpu().numpy().astype(np.uint8))
+          cv2.imwrite("o_"+str(batch_idx)+".png", 255*outputs[0,0,:,:].detach().cpu().numpy().astype(np.uint8))
         loss1 = self.loss_func(outputs, y)
         if torch.isnan(loss1):
             print("Loss nan encountered")
@@ -552,6 +661,7 @@ class RegressionPLModel(pl.LightningModule):
         outputs = self(x)
         loss1 = self.loss_func(outputs, y)
         y_preds = torch.sigmoid(outputs).to('cpu')
+        print("valid xys and pred", xyxys[0], y_preds[0].shape)
         for i, (x1, y1, x2, y2) in enumerate(xyxys):
             self.mask_pred[y1:y2, x1:x2] += F.interpolate(y_preds[i].unsqueeze(0).float(),scale_factor=4,mode='bilinear').squeeze(0).squeeze(0).numpy()
             self.mask_count[y1:y2, x1:x2] += np.ones((self.hparams.size, self.hparams.size))
@@ -560,15 +670,13 @@ class RegressionPLModel(pl.LightningModule):
         return {"loss": loss1}
     
     def on_validation_epoch_end(self):
-        print("on_validation_epoch_end")
         self.mask_pred = np.divide(self.mask_pred, self.mask_count, out=np.zeros_like(self.mask_pred), where=self.mask_count!=0)
         wandb_logger.log_image(key="masks", images=[np.clip(self.mask_pred,0,1)], caption=["probs"])
 
         #reset mask
         self.mask_pred = np.zeros(self.hparams.pred_shape)
         self.mask_count = np.zeros(self.hparams.pred_shape)
-        print("finished logging to wandb.")
-        #self.train_dataset.labels = reload_masks(self.train_dataset.labels, CFG)
+        self.train_dataset.labels = reload_masks(self.train_dataset.labels)
     def configure_optimizers(self):
 
         optimizer = AdamW(self.parameters(), lr=CFG.lr)
@@ -614,14 +722,19 @@ def get_scheduler(cfg, optimizer):
 
 
 
-#fragment_id = CFG.valid_id
+fragment_id = CFG.valid_id
 
-#valid_mask_gt = cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/{fragment_id}_inklabels.png", 0)
+valid_mask_gt = cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/{fragment_id}_inklabels.png", 0)
+print("Reading valid mask", CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/{fragment_id}_inklabels.png", valid_mask_gt)
+
+
 # valid_mask_gt=cv2.resize(valid_mask_gt,(valid_mask_gt.shape[1]//2,valid_mask_gt.shape[0]//2),cv2.INTER_AREA)
-#pred_shape=valid_mask_gt.shape
+pred_shape=valid_mask_gt.shape
 torch.set_float32_matmul_precision('medium')
 
-fragments=[CFG.valid_id] #'20230820203112']
+#fragments=['20240304141530']
+#fragments=['20230820203112']
+fragments = [CFG.valid_id]
 enc_i,enc,fold=0,'i3d',0
 for fid in fragments:
     CFG.valid_id=fid
@@ -631,35 +744,7 @@ for fid in fragments:
     valid_mask_gt = cv2.imread(CFG.comp_dataset_path + f"train_scrolls/{fragment_id}/{fragment_id}_inklabels.png", 0)
 
     pred_shape=valid_mask_gt.shape
-    norm=fold==1
-    wandb_logger = WandbLogger(project="vesivus",name=run_slug+f'{enc}_finetune')
-
-    print('FOLD : ',fold)
-    multiplicative = lambda epoch: 0.9
-
-    trainer = pl.Trainer(
-        max_epochs=24,
-        accelerator="gpu",
-        devices=torch.cuda.device_count(),
-        logger=wandb_logger,
-        default_root_dir="./", #/content/gdrive/MyDrive/vesuvius_model/training/outputs",
-        accumulate_grad_batches=1,
-        check_val_every_n_epoch=1,
-        precision='16-mixed',
-        gradient_clip_val=1.0,
-        gradient_clip_algorithm="norm",
-        strategy='ddp_find_unused_parameters_true',
-        callbacks=[ModelCheckpoint(filename=f'wild12_64_{fid}_{fold}_fr_{enc}'+'{epoch}',dirpath=CFG.model_dir,monitor='train/total_loss',mode='min',save_top_k=CFG.epochs),
-
-                    ],
-    )
-
-    #train_ids = set(['20230702185753','20230929220926','20231005123336','20231012184423','20231007101619','20231016151002','20231022170901','20231031143852','20231106155351','20231210121321','20231221180251','20230820203112']) - set([CFG.valid_id])
-    train_ids = set(['20230702185753','20230929220926','20231005123336','20231012184423','20231007101619','20231016151002','20231022170901','20231031143852','20231106155351','20231210121321','20231221180251','20230820203112']) - set([CFG.valid_id])
-    #train_ids = set(['20230702185753']) #,'20230929220926','20231005123336','20231012184423','20231007101619','20231016151002','20231022170901','20231031143852','20231106155351','20231210121321','20231221180251','20230820203112']) - set([CFG.valid_id])
-    valid_ids = set([CFG.valid_id])
-
-    train_images, train_masks, train_xyxys, train_ids, valid_images, valid_masks, valid_xyxys, valid_ids = get_train_valid_dataset(CFG, train_ids, valid_ids)
+    train_images, train_masks, train_xyxys, train_ids, valid_images, valid_masks, valid_xyxys, valid_ids = get_train_valid_dataset()
     print(len(train_images))
     valid_xyxys = np.stack(valid_xyxys)
     train_dataset = CustomDataset(
@@ -677,10 +762,31 @@ for fid in fragments:
                                 shuffle=False,
                                 num_workers=CFG.num_workers, pin_memory=True, drop_last=True)
 
+    wandb_logger = WandbLogger(project="vesivus",name=run_slug+f'{enc}_finetune')
+    norm=fold==1
     model=RegressionPLModel(enc='i3d',pred_shape=pred_shape,size=CFG.size, train_dataset=train_dataset)
 
+    print('FOLD : ',fold)
     wandb_logger.watch(model, log="all", log_freq=100)
+    multiplicative = lambda epoch: 0.9
 
+    trainer = pl.Trainer(
+        max_epochs=500,
+        accelerator="gpu",
+        devices=torch.cuda.device_count(),
+        logger=wandb_logger,
+        default_root_dir="./", #/content/gdrive/MyDrive/vesuvius_model/training/outputs",
+        check_val_every_n_epoch=3, #check_val_every_n_epoch,
+        accumulate_grad_batches=1,
+        precision='16-mixed',
+        gradient_clip_val=1.0, #0.0125,
+        gradient_clip_algorithm="norm",
+        strategy='ddp_find_unused_parameters_true',
+        callbacks=[ModelCheckpoint(filename=f'wild12_64_{fid}_{fold}_fr_{enc}'+'{epoch}',dirpath=CFG.model_dir,monitor='train/total_loss',mode='min',save_top_k=CFG.epochs),
+
+                    ],
+
+    )
     trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=valid_loader)
 
     wandb.finish()

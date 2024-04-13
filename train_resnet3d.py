@@ -598,7 +598,7 @@ for fid in fragments:
     trainer = pl.Trainer(
         max_epochs=50,
         accelerator="gpu",
-        devices=8,
+        devices=torch.cuda.device_count(),
         check_val_every_n_epoch=4,
         logger=wandb_logger,
         default_root_dir="./models",
